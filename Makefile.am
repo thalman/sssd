@@ -4553,13 +4553,15 @@ ldap_child_SOURCES = \
 ldap_child_CFLAGS = \
     $(AM_CFLAGS) \
     $(POPT_CFLAGS) \
-    $(KRB5_CFLAGS)
+    $(KRB5_CFLAGS) \
+    $(GSSAPI_KRB5_CFLAGS)
 ldap_child_LDADD = \
     libsss_debug.la \
     $(TALLOC_LIBS) \
     $(POPT_LIBS) \
     $(DHASH_LIBS) \
-    $(KRB5_LIBS)
+    $(KRB5_LIBS) \
+    $(GSSAPI_KRB5_LIBS)
 
 if BUILD_SEMANAGE
 selinux_child_SOURCES = \

@@ -27,6 +27,9 @@
 #include <sys/stat.h>
 #include <signal.h>
 #include <popt.h>
+#include <gssapi.h>
+#include <gssapi/gssapi_ext.h>
+#include <gssapi/gssapi_krb5.h>
 
 #include "util/util.h"
 #include "util/sss_krb5.h"
@@ -35,6 +38,7 @@
 #include "providers/krb5/krb5_common.h"
 
 char *global_ccname_file_dummy = NULL;
+bool use_gss = false;
 
 static void sig_term_handler(int sig)
 {
@@ -257,6 +261,583 @@ static int lc_verify_keytab_ex(const char *principal,
     return EOK;
 }
 
+
+static char * gss_error_message(TALLOC_CTX *ctx, OM_uint32 status_code)
+{
+    OM_uint32 message_context;
+    OM_uint32 maj_status;
+    OM_uint32 min_status;
+    gss_buffer_desc status_string;
+    char *message = NULL;
+
+    message_context = 0;
+
+    do {
+
+        maj_status = gss_display_status(
+            &min_status,
+            status_code,
+            GSS_C_GSS_CODE,
+            GSS_C_NO_OID,
+            &message_context,
+            &status_string);
+        if (GSS_ERROR(maj_status)) {
+            DEBUG(SSSDBG_OP_FAILURE, "Error while reading GSS message (maj: %u, min: %u)\n", maj_status, min_status);
+            return message;
+        }
+        if (message) {
+            message = talloc_asprintf_append(message, "%.*s",
+                                             (int)status_string.length,
+                                             (char *)status_string.value);
+        } else {
+            message = talloc_asprintf(ctx, "%.*s",
+                                      (int)status_string.length,
+                                      (char *)status_string.value);
+        }
+        if (message == NULL) {
+            DEBUG(SSSDBG_OP_FAILURE, "Error while reading GSS message - out of memory\n");
+            return NULL;
+        }
+        gss_release_buffer(&min_status, &status_string);
+    } while (message_context != 0);
+
+    return message;
+}
+
+// FIXME: this is copy from sss_krb5 helper
+#include <ctype.h>
+static char *
+sss_krb5_get_primary(TALLOC_CTX *mem_ctx,
+                     const char *pattern,
+                     const char *hostname)
+{
+    char *primary;
+    char *dot;
+    char *c;
+    char *shortname;
+
+    if (strcmp(pattern, "%S$") == 0) {
+        shortname = talloc_strdup(mem_ctx, hostname);
+        if (!shortname) return NULL;
+
+        dot = strchr(shortname, '.');
+        if (dot) {
+            *dot = '\0';
+        }
+
+        for (c=shortname; *c != '\0'; ++c) {
+            *c = toupper(*c);
+        }
+
+        /* The samAccountName is recommended to be less than 20 characters.
+         * This is only for users and groups. For machine accounts,
+         * the real limit is caused by NetBIOS protocol.
+         * NetBIOS names are limited to 16 (15 + $)
+         * https://support.microsoft.com/en-us/help/163409/netbios-suffixes-16th-character-of-the-netbios-name
+         */
+        primary = talloc_asprintf(mem_ctx, "%.15s$", shortname);
+        talloc_free(shortname);
+        return primary;
+    }
+
+    return talloc_asprintf(mem_ctx, pattern, hostname);
+}
+
+
+static krb5_error_code ldap_child_get_realm(TALLOC_CTX *memctx,
+                                            TALLOC_CTX *tmp_ctx,
+                                            krb5_context context,
+                                            const char *realm_str,
+                                            char **_realm_name,
+                                            char **_krb5_msg)
+{
+    char *default_realm = NULL;
+    krb5_error_code krberr;
+
+    *_realm_name = NULL;
+    if (!realm_str) {
+        krberr = krb5_get_default_realm(context, &default_realm);
+        if (krberr != 0) {
+            DEBUG(SSSDBG_OP_FAILURE,
+                  "krb5_get_default_realm() failed: %d\n", krberr);
+            return krberr;
+        }
+
+        *_realm_name = talloc_strdup(tmp_ctx, default_realm);
+        krb5_free_default_realm(context, default_realm);
+        if (!*_realm_name) {
+            krberr = KRB5KRB_ERR_GENERIC;
+            *_krb5_msg = talloc_strdup(memctx, strerror(ENOMEM));
+            return krberr;
+        }
+    } else {
+        *_realm_name = talloc_strdup(tmp_ctx, realm_str);
+        if (!*_realm_name) {
+            krberr = KRB5KRB_ERR_GENERIC;
+            *_krb5_msg = talloc_strdup(memctx, strerror(ENOMEM));
+            return krberr;
+        }
+    }
+
+    DEBUG(SSSDBG_TRACE_INTERNAL, "got realm_name: [%s]\n", *_realm_name);
+    return EOK;
+}
+
+static int get_kdc_time_offset(krb5_context context) {
+#ifdef HAVE_KRB5_GET_TIME_OFFSETS
+    krb5_timestamp kdc_time_offset;
+    int kdc_time_offset_usec;
+    krb5_error_code krberr;
+
+    if (!context) {
+        return 0;
+    }
+
+    krberr = krb5_get_time_offsets(context, &kdc_time_offset,
+            &kdc_time_offset_usec);
+    if (krberr != 0) {
+        const char *__err_msg = sss_krb5_get_error_message(context, krberr);
+        DEBUG(SSSDBG_OP_FAILURE, "Failed to get KDC time offset: %s\n",
+              __err_msg);
+        sss_krb5_free_error_message(context, __err_msg);
+        kdc_time_offset = 0;
+    } else {
+        if (kdc_time_offset_usec > 0) {
+            kdc_time_offset++;
+        }
+    }
+    DEBUG(SSSDBG_TRACE_INTERNAL, "Got KDC time offset\n");
+    return kdc_time_offset;
+#else
+    /* If we don't have this function, just assume no offset */
+    return 0;
+#endif
+}
+
+/* acquire credentials from keytab */
+static errno_t ldap_child_gss_get_creds(TALLOC_CTX *ctx,
+                                        const char *principal,
+                                        const char *realm,
+                                        OM_uint32 lifetime,
+                                        bool canonicalize,
+                                        const char *keytab_name,
+                                        gss_cred_id_t *_creds,
+                                        char **_principal)
+{
+    gss_buffer_desc name_buf;
+    gss_name_t gss_name = GSS_C_NO_NAME;
+    gss_key_value_set_desc cstore;
+    OM_uint32 major;
+    OM_uint32 minor;
+    gss_OID_set_desc krb5_set = {1, gss_mech_krb5};
+    char *full_principal = NULL;
+    errno_t ret = EOK;
+
+    *_principal = NULL;
+
+    if (principal == NULL) {
+        ret = EINVAL;
+        goto done;
+    }
+
+    if (strchr(principal, '@') || realm == NULL) {
+        full_principal = talloc_strdup(ctx, principal);
+    } else {
+        full_principal = talloc_asprintf(ctx, "%s@%s",
+                                         principal, realm);
+    }
+    if (!full_principal) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    name_buf.value = (void *)(uintptr_t)full_principal;
+    name_buf.length = strlen(full_principal);
+    major = gss_import_name(&minor, &name_buf, GSS_C_NT_USER_NAME, &gss_name);
+    if (GSS_ERROR(major)) {
+        DEBUG(SSSDBG_OP_FAILURE, "Could not convert %s to GSS name\n", full_principal);
+        ret = EIO;
+        goto done;
+    }
+
+    // FIXME: canonicalize? krb options?
+
+    if (keytab_name) {
+        cstore.elements = talloc_array(ctx, struct gss_key_value_element_struct, 1);
+        cstore.elements[0].key = "client_keytab";
+        cstore.elements[0].value = keytab_name;
+        cstore.count = 1;
+        major = gss_acquire_cred_from(&minor, gss_name, lifetime,
+                                      &krb5_set, GSS_C_INITIATE,
+                                      &cstore, _creds, NULL, NULL);
+        talloc_free(cstore.elements);
+    } else {
+        major = gss_acquire_cred(&minor, gss_name, lifetime,
+                                 &krb5_set, GSS_C_INITIATE,
+                                 _creds, NULL, NULL);
+    }
+    if (GSS_ERROR(major)) {
+        DEBUG(SSSDBG_OP_FAILURE, "Could not acquire credentials for %s\n", full_principal);
+        ret = EIO;
+        goto done;
+    }
+
+    DEBUG(SSSDBG_TRACE_LIBS, "GSS acquire credentials for %s OK\n", full_principal);
+    *_principal = full_principal;
+    full_principal = NULL;
+
+ done:
+    gss_release_name(&minor, &gss_name);
+    talloc_free(full_principal);
+    return ret;
+}
+
+static errno_t sss_compose_principal(TALLOC_CTX *ctx,
+                                     const char *primary_pattern,
+                                     const char *realm_pattern,
+                                     const char *hostname,
+                                     const char *realm,
+                                     char **_full_principal)
+{
+    char *primary_part = NULL;
+    char *realm_part = NULL;
+    errno_t ret;
+
+    *_full_principal = NULL;
+
+    if (primary_pattern == NULL || hostname == NULL || realm == NULL) {
+        ret = EINVAL;
+        goto done;
+    }
+
+    primary_part = sss_krb5_get_primary(ctx,
+                                        primary_pattern,
+                                        hostname);
+    if (primary_part == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    if (realm_pattern) {
+        realm_part = talloc_asprintf(ctx, realm_pattern, realm);
+        if (realm_part == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+    }
+
+    if (realm_part == NULL) {
+        *_full_principal = primary_part;
+        primary_part = NULL;
+    } else {
+        *_full_principal = talloc_asprintf("%s@%s", primary_part, realm_part);
+        if (*_full_principal == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+    }
+ done:
+    talloc_free(primary_part);
+    talloc_free(realm_part);
+    return ret;
+}
+
+/* find suitable credentials from keytab */
+static errno_t ldap_child_gss_find_host_creds(TALLOC_CTX *ctx,
+                                              const char *hostname,
+                                              const char *realm,
+                                              bool canonicalize,
+                                              int lifetime,
+                                              const char *keytab_name,
+                                              gss_cred_id_t *_creds,
+                                              char **_principal)
+{
+    char *full_principal;
+    errno_t ret;
+    const char *desired_realm = realm;
+    int idx = 0;
+
+    /**
+     * The %s conversion is passed as-is, the %S conversion is translated to
+     * "short host name"
+     *
+     * Priority of lookup:
+     * - our.hostname@REALM or host/our.hostname@REALM depending on the input
+     * - SHORT.HOSTNAME$@REALM (AD domain)
+     * - host/our.hostname@REALM
+     * - foobar$@REALM (AD domain)
+     * - host/foobar@REALM
+     * - host/foo@BAR
+     * - pick the first principal in the keytab
+     */
+    const char *primary_patterns[] = {"%s", "%S$", "host/%s", "*$", "host/*",
+                                      "host/*", NULL};
+    const char *realm_patterns[] =   {"%s", "%s",  "%s",      "%s", "%s",
+                                      NULL,     NULL};
+
+    /* we do not have full principal, search keytab for known patterns */
+    if (!desired_realm) {
+        desired_realm = "*";
+    }
+    if (!hostname) {
+        hostname = "*";
+    }
+
+    do {
+        ret = sss_compose_principal(ctx,
+                                    primary_patterns[idx],
+                                    realm_patterns[idx],
+                                    hostname,
+                                    realm,
+                                    &full_principal);
+        if (ret != EOK) {
+            talloc_zfree(full_principal);
+            return ret;
+        }
+
+        ret = ldap_child_gss_get_creds(ctx,
+                                       full_principal,
+                                       NULL,
+                                       lifetime,
+                                       canonicalize,
+                                       keytab_name,
+                                       _creds,
+                                       _principal);
+        talloc_zfree(full_principal);
+        if (ret == EOK) {
+            break;
+        }
+
+        ++idx;
+    } while(primary_patterns[idx-1] != NULL || realm_patterns[idx-1] != NULL);
+
+    return ret;
+}
+
+static krb5_error_code ldap_child_get_tgt_gss_sync(TALLOC_CTX *memctx,
+                                                   krb5_context context,
+                                                   const char *realm_str,
+                                                   const char *princ_str,
+                                                   const char *keytab_name,
+                                                   const krb5_deltat lifetime,
+                                                   const char **ccname_out,
+                                                   time_t *expire_time_out,
+                                                   char **_krb5_msg)
+{
+    char *ccname;
+    char *ccname_dummy;
+    char *realm_name = NULL;
+    char *full_principal = NULL;
+    // char *default_realm = NULL;
+    char *tmp_str = NULL;
+    krb5_keytab keytab = NULL;
+    krb5_ccache ccache = NULL;
+    krb5_principal kprinc;
+    // krb5_creds my_creds;
+    krb5_get_init_creds_opt *options = NULL;
+    krb5_error_code krberr;
+    krb5_timestamp kdc_time_offset;
+    int canonicalize = 0;
+    // krb5_error_code ret;
+    errno_t error_code;
+    TALLOC_CTX *tmp_ctx;
+    char *ccname_file_dummy = NULL;
+    char *ccname_file;
+
+    gss_name_t gss_name = GSS_C_NO_NAME;
+    gss_cred_id_t creds = NULL;
+    OM_uint32 major, minor;
+
+    *_krb5_msg = NULL;
+
+    tmp_ctx = talloc_new(memctx);
+    if (tmp_ctx == NULL) {
+        krberr = KRB5KRB_ERR_GENERIC;
+        *_krb5_msg = talloc_strdup(memctx, strerror(ENOMEM));
+        goto done;
+    }
+
+    error_code = set_child_debugging(context);
+    if (error_code != EOK) {
+        DEBUG(SSSDBG_MINOR_FAILURE, "Cannot set krb5_child debugging\n");
+    }
+
+    tmp_str = getenv("KRB5_CANONICALIZE");
+    if (tmp_str != NULL && strcasecmp(tmp_str, "true") == 0) {
+        DEBUG(SSSDBG_CONF_SETTINGS, "Will canonicalize principals\n");
+        canonicalize = 1;
+    }
+
+    kdc_time_offset = get_kdc_time_offset(context);
+
+    krberr = ldap_child_get_realm(memctx, tmp_ctx, context, realm_str, &realm_name, _krb5_msg);
+    if (krberr != 0) {
+        goto done;
+    }
+
+
+    if (princ_str) {
+        error_code = ldap_child_gss_get_creds(memctx,
+                                              princ_str, realm_name,
+                                              canonicalize, lifetime,
+                                              keytab_name, &creds, &full_principal);
+    } else {
+        char hostname[HOST_NAME_MAX + 1];
+
+        error_code = gethostname(hostname, sizeof(hostname));
+        if (error_code == -1) {
+            krberr = KRB5KRB_ERR_GENERIC;
+            *_krb5_msg = talloc_asprintf(memctx, "hostname() failed: [%d][%s]",
+                                         errno, strerror(errno));
+            goto done;
+        }
+        hostname[HOST_NAME_MAX] = '\0';
+
+        DEBUG(SSSDBG_TRACE_LIBS, "got hostname: [%s]\n", hostname);
+
+        error_code = ldap_child_gss_find_host_creds(memctx,
+                                                    hostname, realm_name,
+                                                    canonicalize, lifetime,
+                                                    keytab_name, &creds, &full_principal);
+    }
+    if (error_code == EOK) {
+        krberr = KRB5_KT_IOERR;
+        *_krb5_msg = talloc_strdup(memctx,
+                                   "select_principal_from_keytab() failed");
+        goto done;
+    }
+
+    DEBUG(SSSDBG_TRACE_INTERNAL, "krb5_parse_name(%s)\n", full_principal);
+    krberr = krb5_parse_name(context, full_principal, &kprinc);
+    if (krberr != 0) {
+        DEBUG(SSSDBG_OP_FAILURE, "krb5_parse_name() failed: %d\n", krberr);
+        goto done;
+    }
+
+    ccname_file = talloc_asprintf(tmp_ctx, "%s/ccache_%s",
+                                  DB_PATH, realm_name);
+    if (ccname_file == NULL) {
+        krberr = KRB5KRB_ERR_GENERIC;
+        *_krb5_msg = talloc_strdup(memctx, strerror(ENOMEM));
+        goto done;
+    }
+
+    ccname_file_dummy = talloc_asprintf(tmp_ctx, "%s/ccache_%s_XXXXXX",
+                                        DB_PATH, realm_name);
+    if (ccname_file_dummy == NULL) {
+        krberr = KRB5KRB_ERR_GENERIC;
+        *_krb5_msg = talloc_strdup(memctx, strerror(ENOMEM));
+        goto done;
+    }
+    global_ccname_file_dummy = ccname_file_dummy;
+
+    error_code = sss_unique_filename(tmp_ctx, ccname_file_dummy);
+    if (error_code != EOK) {
+        krberr = KRB5KRB_ERR_GENERIC;
+        *_krb5_msg = talloc_asprintf(memctx,
+                                     "sss_unique_filename() failed: [%d][%s]",
+                                     error_code, strerror(error_code));
+        goto done;
+    }
+
+    /* prepace new ccache */
+    ccname_dummy = talloc_asprintf(tmp_ctx, "FILE:%s", ccname_file_dummy);
+    ccname = talloc_asprintf(tmp_ctx, "FILE:%s", ccname_file);
+    if (ccname_dummy == NULL || ccname == NULL) {
+        krberr = KRB5KRB_ERR_GENERIC;
+        *_krb5_msg = talloc_strdup(memctx, strerror(ENOMEM));
+        goto done;
+    }
+    DEBUG(SSSDBG_TRACE_INTERNAL, "keytab ccname: [%s]\n", ccname_dummy);
+    ccname_file_dummy = talloc_asprintf(tmp_ctx, "%s/ccache_%s_XXXXXX",
+                                        DB_PATH, realm_name);
+    if (ccname_file_dummy == NULL) {
+        krberr = KRB5KRB_ERR_GENERIC;
+        *_krb5_msg = talloc_strdup(memctx, strerror(ENOMEM));
+        goto done;
+    }
+    global_ccname_file_dummy = ccname_file_dummy;
+
+    error_code = sss_unique_filename(tmp_ctx, ccname_file_dummy);
+    if (error_code != EOK) {
+        krberr = KRB5KRB_ERR_GENERIC;
+        *_krb5_msg = talloc_asprintf(memctx,
+                                     "sss_unique_filename() failed: [%d][%s]",
+                                     error_code, strerror(error_code));
+        goto done;
+    }
+
+    krberr = krb5_cc_resolve(context, ccname_dummy, &ccache);
+    if (krberr != 0) {
+        DEBUG(SSSDBG_OP_FAILURE, "krb5_cc_resolve() failed: %d\n", krberr);
+        goto done;
+    }
+    // FIXME: use options?
+    krberr = krb5_cc_initialize(context, ccache, kprinc);
+    if (krberr != 0) {
+        DEBUG(SSSDBG_OP_FAILURE, "krb5_cc_initialize() failed: %d\n", krberr);
+        goto done;
+    }
+
+    // FIXME: can we use gss_store_cred_into() instead of gss_krb5_copy_ccache()?
+    major = gss_krb5_copy_ccache(&minor, creds, ccache);
+    if (GSS_ERROR(major)) {
+        DEBUG(SSSDBG_OP_FAILURE,"gss_krb5_copy_ccache failed\n");
+        krberr = KRB5KRB_ERR_GENERIC;
+        *_krb5_msg = gss_error_message(memctx, major);
+        goto done;
+    }
+
+    DEBUG(SSSDBG_TRACE_INTERNAL,
+          "Renaming [%s] to [%s]\n", ccname_file_dummy, ccname_file);
+    error_code = rename(ccname_file_dummy, ccname_file);
+    if (error_code == -1) {
+        error_code = errno;
+        DEBUG(SSSDBG_CRIT_FAILURE,
+              "rename failed [%d][%s].\n", error_code, strerror(error_code));
+        krberr = KRB5KRB_ERR_GENERIC;
+        *_krb5_msg = talloc_asprintf(memctx,
+                                     "rename() failed: [%d][%s]",
+                                     error_code, strerror(error_code));
+
+        goto done;
+    }
+    global_ccname_file_dummy = NULL;
+
+    krberr = 0;
+    *ccname_out = talloc_steal(memctx, ccname);
+    // *expire_time_out = my_creds.times.endtime - kdc_time_offset;
+    *expire_time_out = time(NULL) + 24*60*60 - kdc_time_offset; // FIXME: get the time from TGT
+done:
+    talloc_zfree(full_principal);
+    krb5_get_init_creds_opt_free(context, options);
+    if (krberr != 0) {
+        if (*_krb5_msg == NULL) {
+            /* no custom error message provided hence get one from libkrb5 */
+            const char *__krberr_msg = sss_krb5_get_error_message(context, krberr);
+            *_krb5_msg = talloc_strdup(memctx, __krberr_msg);
+            sss_krb5_free_error_message(context, __krberr_msg);
+        }
+
+        sss_log(SSS_LOG_ERR,
+                "Failed to initialize credentials using keytab [%s]: %s. "
+                "Unable to create GSSAPI-encrypted LDAP connection.",
+                sss_printable_keytab_name(context, keytab_name), *_krb5_msg);
+
+        DEBUG(SSSDBG_FATAL_FAILURE,
+              "Failed to initialize credentials using keytab [%s]: %s. "
+              "Unable to create GSSAPI-encrypted LDAP connection.\n",
+              sss_printable_keytab_name(context, keytab_name), *_krb5_msg);
+    }
+    if (keytab) krb5_kt_close(context, keytab);
+    if (context) krb5_free_context(context);
+    gss_release_name(&minor, &gss_name);
+    gss_release_cred(&minor, &creds);
+    talloc_free(tmp_ctx);
+    return krberr;
+}
+
+
 static krb5_error_code ldap_child_get_tgt_sync(TALLOC_CTX *memctx,
                                                krb5_context context,
                                                const char *realm_str,
@@ -271,7 +852,7 @@ static krb5_error_code ldap_child_get_tgt_sync(TALLOC_CTX *memctx,
     char *ccname_dummy;
     char *realm_name = NULL;
     char *full_princ = NULL;
-    char *default_realm = NULL;
+    // char *default_realm = NULL;
     char *tmp_str = NULL;
     krb5_keytab keytab = NULL;
     krb5_ccache ccache = NULL;
@@ -302,31 +883,10 @@ static krb5_error_code ldap_child_get_tgt_sync(TALLOC_CTX *memctx,
         DEBUG(SSSDBG_MINOR_FAILURE, "Cannot set krb5_child debugging\n");
     }
 
-    if (!realm_str) {
-        krberr = krb5_get_default_realm(context, &default_realm);
-        if (krberr != 0) {
-            DEBUG(SSSDBG_OP_FAILURE,
-                  "krb5_get_default_realm() failed: %d\n", krberr);
-            goto done;
-        }
-
-        realm_name = talloc_strdup(tmp_ctx, default_realm);
-        krb5_free_default_realm(context, default_realm);
-        if (!realm_name) {
-            krberr = KRB5KRB_ERR_GENERIC;
-            *_krb5_msg = talloc_strdup(memctx, strerror(ENOMEM));
-            goto done;
-        }
-    } else {
-        realm_name = talloc_strdup(tmp_ctx, realm_str);
-        if (!realm_name) {
-            krberr = KRB5KRB_ERR_GENERIC;
-            *_krb5_msg = talloc_strdup(memctx, strerror(ENOMEM));
-            goto done;
-        }
+    krberr = ldap_child_get_realm(memctx, tmp_ctx, context, realm_str, &realm_name, _krb5_msg);
+    if (krberr != 0) {
+        goto done;
     }
-
-    DEBUG(SSSDBG_TRACE_INTERNAL, "got realm_name: [%s]\n", realm_name);
 
     if (princ_str) {
         if (!strchr(princ_str, '@')) {
@@ -632,6 +1192,9 @@ int main(int argc, const char *argv[])
     struct response *resp = NULL;
     ssize_t written;
 
+    /* use gss api? */
+    use_gss = getenv("USE_GSS") != NULL;
+
     struct poptOption long_options[] = {
         POPT_AUTOHELP
         SSSD_DEBUG_OPTS
@@ -719,27 +1282,45 @@ int main(int argc, const char *argv[])
         goto fail;
     }
 
-    kerr = privileged_krb5_setup(ibuf);
-    if (kerr != EOK) {
-        DEBUG(SSSDBG_CRIT_FAILURE, "Privileged Krb5 setup failed.\n");
-        goto fail;
+    if (use_gss) {
+        DEBUG(SSSDBG_TRACE_INTERNAL, "GSS: skipping priviledged initialization\n");
+        kerr = sss_krb5_init_context(&ibuf->context);
+        // kerr = privileged_krb5_setup(ibuf);
+        if (kerr != 0) {
+            DEBUG(SSSDBG_CRIT_FAILURE, "Failed to init kerberos context\n");
+            goto fail;
+        }
+    } else {
+        kerr = privileged_krb5_setup(ibuf);
+        if (kerr != EOK) {
+            DEBUG(SSSDBG_CRIT_FAILURE, "Privileged Krb5 setup failed.\n");
+            goto fail;
+        }
+        DEBUG(SSSDBG_TRACE_INTERNAL, "Kerberos context initialized\n");
     }
-    DEBUG(SSSDBG_TRACE_INTERNAL, "Kerberos context initialized\n");
 
-    kerr = become_user(ibuf->uid, ibuf->gid);
-    if (kerr != 0) {
-        DEBUG(SSSDBG_CRIT_FAILURE, "become_user failed.\n");
-        goto fail;
+    if (use_gss) {
+        DEBUG(SSSDBG_TRACE_INTERNAL, "getting TGT sync using gss\n");
+        kerr = ldap_child_get_tgt_gss_sync(main_ctx, ibuf->context,
+                                           ibuf->realm_str, ibuf->princ_str,
+                                           ibuf->keytab_name, ibuf->lifetime,
+                                           &ccname, &expire_time, &krb5_msg);
+    } else {
+        kerr = become_user(ibuf->uid, ibuf->gid);
+        if (kerr != 0) {
+            DEBUG(SSSDBG_CRIT_FAILURE, "become_user failed.\n");
+            goto fail;
+        }
+        DEBUG(SSSDBG_TRACE_INTERNAL,
+              "Running as [%"SPRIuid"][%"SPRIgid"].\n", geteuid(), getegid());
+
+        DEBUG(SSSDBG_TRACE_INTERNAL, "getting TGT sync\n");
+        kerr = ldap_child_get_tgt_sync(main_ctx, ibuf->context,
+                                           ibuf->realm_str, ibuf->princ_str,
+                                           ibuf->keytab_name, ibuf->lifetime,
+                                           &ccname, &expire_time, &krb5_msg);
     }
 
-    DEBUG(SSSDBG_TRACE_INTERNAL,
-          "Running as [%"SPRIuid"][%"SPRIgid"].\n", geteuid(), getegid());
-
-    DEBUG(SSSDBG_TRACE_INTERNAL, "getting TGT sync\n");
-    kerr = ldap_child_get_tgt_sync(main_ctx, ibuf->context,
-                                   ibuf->realm_str, ibuf->princ_str,
-                                   ibuf->keytab_name, ibuf->lifetime,
-                                   &ccname, &expire_time, &krb5_msg);
     if (kerr != EOK) {
         DEBUG(SSSDBG_CRIT_FAILURE, "ldap_child_get_tgt_sync failed.\n");
         /* Do not return, must report failure */
