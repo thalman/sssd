@@ -422,7 +422,8 @@ static errno_t ldap_child_gss_get_creds(TALLOC_CTX *ctx,
                                         bool canonicalize,
                                         const char *keytab_name,
                                         gss_cred_id_t *_creds,
-                                        char **_principal)
+                                        char **_principal,
+                                        OM_uint32 *_lifetime_out)
 {
     gss_buffer_desc name_buf;
     gss_name_t gss_name = GSS_C_NO_NAME;
@@ -469,12 +470,12 @@ static errno_t ldap_child_gss_get_creds(TALLOC_CTX *ctx,
         cstore.count = 1;
         major = gss_acquire_cred_from(&minor, gss_name, lifetime,
                                       &krb5_set, GSS_C_INITIATE,
-                                      &cstore, _creds, NULL, NULL);
+                                      &cstore, _creds, NULL, _lifetime_out);
         talloc_free(cstore.elements);
     } else {
         major = gss_acquire_cred(&minor, gss_name, lifetime,
                                  &krb5_set, GSS_C_INITIATE,
-                                 _creds, NULL, NULL);
+                                 _creds, NULL, _lifetime_out);
     }
     if (GSS_ERROR(major)) {
         DEBUG(SSSDBG_OP_FAILURE, "Could not acquire credentials for %s\n", full_principal);
@@ -550,7 +551,8 @@ static errno_t ldap_child_gss_find_host_creds(TALLOC_CTX *ctx,
                                               int lifetime,
                                               const char *keytab_name,
                                               gss_cred_id_t *_creds,
-                                              char **_principal)
+                                              char **_principal,
+                                              OM_uint32 *_lifetime)
 {
     char *full_principal;
     errno_t ret;
@@ -602,7 +604,8 @@ static errno_t ldap_child_gss_find_host_creds(TALLOC_CTX *ctx,
                                        canonicalize,
                                        keytab_name,
                                        _creds,
-                                       _principal);
+                                       _principal,
+                                       _lifetime);
         talloc_zfree(full_principal);
         if (ret == EOK) {
             break;
@@ -646,7 +649,8 @@ static krb5_error_code ldap_child_get_tgt_gss_sync(TALLOC_CTX *memctx,
 
     gss_name_t gss_name = GSS_C_NO_NAME;
     gss_cred_id_t creds = NULL;
-    OM_uint32 major, minor;
+    OM_uint32 major, minor, lifetime_out;
+    time_t ticket_eol;
 
     *_krb5_msg = NULL;
 
@@ -680,7 +684,9 @@ static krb5_error_code ldap_child_get_tgt_gss_sync(TALLOC_CTX *memctx,
         error_code = ldap_child_gss_get_creds(memctx,
                                               princ_str, realm_name,
                                               canonicalize, lifetime,
-                                              keytab_name, &creds, &full_principal);
+                                              keytab_name,
+                                              &creds, &full_principal,
+                                              &lifetime_out);
     } else {
         char hostname[HOST_NAME_MAX + 1];
 
@@ -698,14 +704,18 @@ static krb5_error_code ldap_child_get_tgt_gss_sync(TALLOC_CTX *memctx,
         error_code = ldap_child_gss_find_host_creds(memctx,
                                                     hostname, realm_name,
                                                     canonicalize, lifetime,
-                                                    keytab_name, &creds, &full_principal);
+                                                    keytab_name,
+                                                    &creds, &full_principal,
+                                                    &lifetime_out);
     }
-    if (error_code == EOK) {
+
+    if (error_code != EOK) {
         krberr = KRB5_KT_IOERR;
         *_krb5_msg = talloc_strdup(memctx,
                                    "select_principal_from_keytab() failed");
         goto done;
     }
+    ticket_eol = time(NULL) + lifetime_out;
 
     DEBUG(SSSDBG_TRACE_INTERNAL, "krb5_parse_name(%s)\n", full_principal);
     krberr = krb5_parse_name(context, full_principal, &kprinc);
@@ -806,8 +816,7 @@ static krb5_error_code ldap_child_get_tgt_gss_sync(TALLOC_CTX *memctx,
 
     krberr = 0;
     *ccname_out = talloc_steal(memctx, ccname);
-    // *expire_time_out = my_creds.times.endtime - kdc_time_offset;
-    *expire_time_out = time(NULL) + 24*60*60 - kdc_time_offset; // FIXME: get the time from TGT
+    *expire_time_out = ticket_eol - kdc_time_offset;
 done:
     talloc_zfree(full_principal);
     krb5_get_init_creds_opt_free(context, options);
@@ -1192,8 +1201,10 @@ int main(int argc, const char *argv[])
     struct response *resp = NULL;
     ssize_t written;
 
-    /* use gss api? */
-    use_gss = getenv("USE_GSS") != NULL;
+    /* if GSS_USE_PROXY is set, we use GSS. No matter whether */
+    /* it is set to "yes" or "no". To use direct access to keytab */
+    /* unset this environment variable  */
+    use_gss = getenv("GSS_USE_PROXY") != NULL;
 
     struct poptOption long_options[] = {
         POPT_AUTOHELP
