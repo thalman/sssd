@@ -414,6 +414,40 @@ static int get_kdc_time_offset(krb5_context context) {
 #endif
 }
 
+/* get principal from gss gredentials */
+static char *gss_get_principal_from_creds(TALLOC_CTX *ctx, gss_cred_id_t creds)
+{
+    OM_uint32 major;
+    OM_uint32 minor;
+    gss_buffer_desc gss_name_buf;
+    gss_name_t gss_name = GSS_C_NO_NAME;
+    char *result = NULL;
+
+    major = gss_inquire_cred(&minor, creds, &gss_name, NULL, NULL, NULL);
+    if (GSS_ERROR(major)) {
+        DEBUG(SSSDBG_MINOR_FAILURE, "Could not get principal from credentials - "
+                                    "gss_inquire_cred failed\n");
+        goto done;
+    }
+
+    major = gss_display_name(&minor, gss_name, &gss_name_buf, NULL);
+    if (GSS_ERROR(major)) {
+        DEBUG(SSSDBG_MINOR_FAILURE, "Could not get principal from credentials - "
+                                    "gss_display_name failed\n");
+        goto done;
+    }
+
+    result = talloc_asprintf(ctx, "%.*s", gss_name_buf.length, gss_name_buf.value);
+
+done:
+    major = gss_release_buffer(&minor, &gss_name_buf);
+    if (GSS_ERROR(major)) {
+        DEBUG(SSSDBG_MINOR_FAILURE, "The gss_release_buffer failed\n");
+    }
+
+    return result;
+}
+
 /* acquire credentials from keytab */
 static errno_t ldap_child_gss_get_creds(TALLOC_CTX *ctx,
                                         const char *principal,
@@ -483,9 +517,15 @@ static errno_t ldap_child_gss_get_creds(TALLOC_CTX *ctx,
         goto done;
     }
 
+    *_principal = gss_get_principal_from_creds(ctx, *_creds);
+    if (*_principal == NULL) {
+        /* getting principal from credentials failed lets use the input */
+        /* value to have at least something */
+        *_principal = full_principal;
+        full_principal = NULL;
+    }
+
     DEBUG(SSSDBG_TRACE_LIBS, "GSS acquire credentials for %s OK\n", full_principal);
-    *_principal = full_principal;
-    full_principal = NULL;
 
  done:
     gss_release_name(&minor, &gss_name);
@@ -570,7 +610,7 @@ static errno_t ldap_child_gss_find_host_creds(TALLOC_CTX *ctx,
      * - foobar$@REALM (AD domain)
      * - host/foobar@REALM
      * - host/foo@BAR
-     * - pick the first principal in the keytab
+     * - pick the first principal in the keytab (check host/*)
      */
     const char *primary_patterns[] = {"%s", "%S$", "host/%s", "*$", "host/*",
                                       "host/*", NULL};
