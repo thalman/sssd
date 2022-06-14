@@ -33,6 +33,7 @@
 
 #include "util/util.h"
 #include "util/sss_krb5.h"
+#include "util/sss_gss.h"
 #include "util/child_common.h"
 #include "providers/backend.h"
 #include "providers/krb5/krb5_common.h"
@@ -262,87 +263,6 @@ static int lc_verify_keytab_ex(const char *principal,
 }
 
 
-static char * gss_error_message(TALLOC_CTX *ctx, OM_uint32 status_code)
-{
-    OM_uint32 message_context;
-    OM_uint32 maj_status;
-    OM_uint32 min_status;
-    gss_buffer_desc status_string;
-    char *message = NULL;
-
-    message_context = 0;
-
-    do {
-
-        maj_status = gss_display_status(
-            &min_status,
-            status_code,
-            GSS_C_GSS_CODE,
-            GSS_C_NO_OID,
-            &message_context,
-            &status_string);
-        if (GSS_ERROR(maj_status)) {
-            DEBUG(SSSDBG_OP_FAILURE, "Error while reading GSS message (maj: %u, min: %u)\n", maj_status, min_status);
-            return message;
-        }
-        if (message) {
-            message = talloc_asprintf_append(message, "%.*s",
-                                             (int)status_string.length,
-                                             (char *)status_string.value);
-        } else {
-            message = talloc_asprintf(ctx, "%.*s",
-                                      (int)status_string.length,
-                                      (char *)status_string.value);
-        }
-        if (message == NULL) {
-            DEBUG(SSSDBG_OP_FAILURE, "Error while reading GSS message - out of memory\n");
-            return NULL;
-        }
-        gss_release_buffer(&min_status, &status_string);
-    } while (message_context != 0);
-
-    return message;
-}
-
-// FIXME: this is copy from sss_krb5 helper
-#include <ctype.h>
-static char *
-sss_krb5_get_primary(TALLOC_CTX *mem_ctx,
-                     const char *pattern,
-                     const char *hostname)
-{
-    char *primary;
-    char *dot;
-    char *c;
-    char *shortname;
-
-    if (strcmp(pattern, "%S$") == 0) {
-        shortname = talloc_strdup(mem_ctx, hostname);
-        if (!shortname) return NULL;
-
-        dot = strchr(shortname, '.');
-        if (dot) {
-            *dot = '\0';
-        }
-
-        for (c=shortname; *c != '\0'; ++c) {
-            *c = toupper(*c);
-        }
-
-        /* The samAccountName is recommended to be less than 20 characters.
-         * This is only for users and groups. For machine accounts,
-         * the real limit is caused by NetBIOS protocol.
-         * NetBIOS names are limited to 16 (15 + $)
-         * https://support.microsoft.com/en-us/help/163409/netbios-suffixes-16th-character-of-the-netbios-name
-         */
-        primary = talloc_asprintf(mem_ctx, "%.15s$", shortname);
-        talloc_free(shortname);
-        return primary;
-    }
-
-    return talloc_asprintf(mem_ctx, pattern, hostname);
-}
-
 
 static krb5_error_code ldap_child_get_realm(TALLOC_CTX *memctx,
                                             TALLOC_CTX *tmp_ctx,
@@ -414,248 +334,6 @@ static int get_kdc_time_offset(krb5_context context) {
 #endif
 }
 
-/* get principal from gss gredentials */
-static char *gss_get_principal_from_creds(TALLOC_CTX *ctx, gss_cred_id_t creds)
-{
-    OM_uint32 major;
-    OM_uint32 minor;
-    gss_buffer_desc gss_name_buf;
-    gss_name_t gss_name = GSS_C_NO_NAME;
-    char *result = NULL;
-
-    major = gss_inquire_cred(&minor, creds, &gss_name, NULL, NULL, NULL);
-    if (GSS_ERROR(major)) {
-        DEBUG(SSSDBG_MINOR_FAILURE, "Could not get principal from credentials - "
-                                    "gss_inquire_cred failed\n");
-        goto done;
-    }
-
-    major = gss_display_name(&minor, gss_name, &gss_name_buf, NULL);
-    if (GSS_ERROR(major)) {
-        DEBUG(SSSDBG_MINOR_FAILURE, "Could not get principal from credentials - "
-                                    "gss_display_name failed\n");
-        goto done;
-    }
-
-    result = talloc_asprintf(ctx, "%.*s", gss_name_buf.length, gss_name_buf.value);
-
-done:
-    major = gss_release_buffer(&minor, &gss_name_buf);
-    if (GSS_ERROR(major)) {
-        DEBUG(SSSDBG_MINOR_FAILURE, "The gss_release_buffer failed\n");
-    }
-
-    return result;
-}
-
-/* acquire credentials from keytab */
-static errno_t ldap_child_gss_get_creds(TALLOC_CTX *ctx,
-                                        const char *principal,
-                                        const char *realm,
-                                        OM_uint32 lifetime,
-                                        bool canonicalize,
-                                        const char *keytab_name,
-                                        gss_cred_id_t *_creds,
-                                        char **_principal,
-                                        OM_uint32 *_lifetime_out)
-{
-    gss_buffer_desc name_buf;
-    gss_name_t gss_name = GSS_C_NO_NAME;
-    gss_key_value_set_desc cstore;
-    OM_uint32 major;
-    OM_uint32 minor;
-    gss_OID_set_desc krb5_set = {1, gss_mech_krb5};
-    char *full_principal = NULL;
-    errno_t ret = EOK;
-
-    *_principal = NULL;
-
-    if (principal == NULL) {
-        ret = EINVAL;
-        goto done;
-    }
-
-    if (strchr(principal, '@') || realm == NULL) {
-        full_principal = talloc_strdup(ctx, principal);
-    } else {
-        full_principal = talloc_asprintf(ctx, "%s@%s",
-                                         principal, realm);
-    }
-    if (!full_principal) {
-        ret = ENOMEM;
-        goto done;
-    }
-
-    name_buf.value = (void *)(uintptr_t)full_principal;
-    name_buf.length = strlen(full_principal);
-    major = gss_import_name(&minor, &name_buf, GSS_C_NT_USER_NAME, &gss_name);
-    if (GSS_ERROR(major)) {
-        DEBUG(SSSDBG_OP_FAILURE, "Could not convert %s to GSS name\n", full_principal);
-        ret = EIO;
-        goto done;
-    }
-
-    // FIXME: canonicalize? krb options?
-
-    if (keytab_name) {
-        cstore.elements = talloc_array(ctx, struct gss_key_value_element_struct, 1);
-        cstore.elements[0].key = "client_keytab";
-        cstore.elements[0].value = keytab_name;
-        cstore.count = 1;
-        major = gss_acquire_cred_from(&minor, gss_name, lifetime,
-                                      &krb5_set, GSS_C_INITIATE,
-                                      &cstore, _creds, NULL, _lifetime_out);
-        talloc_free(cstore.elements);
-    } else {
-        major = gss_acquire_cred(&minor, gss_name, lifetime,
-                                 &krb5_set, GSS_C_INITIATE,
-                                 _creds, NULL, _lifetime_out);
-    }
-    if (GSS_ERROR(major)) {
-        DEBUG(SSSDBG_OP_FAILURE, "Could not acquire credentials for %s\n", full_principal);
-        ret = EIO;
-        goto done;
-    }
-
-    *_principal = gss_get_principal_from_creds(ctx, *_creds);
-    if (*_principal == NULL) {
-        /* getting principal from credentials failed lets use the input */
-        /* value to have at least something */
-        *_principal = full_principal;
-        full_principal = NULL;
-    }
-
-    DEBUG(SSSDBG_TRACE_LIBS, "GSS acquire credentials for %s OK\n", full_principal);
-
- done:
-    gss_release_name(&minor, &gss_name);
-    talloc_free(full_principal);
-    return ret;
-}
-
-static errno_t sss_compose_principal(TALLOC_CTX *ctx,
-                                     const char *primary_pattern,
-                                     const char *realm_pattern,
-                                     const char *hostname,
-                                     const char *realm,
-                                     char **_full_principal)
-{
-    char *primary_part = NULL;
-    char *realm_part = NULL;
-    errno_t ret;
-
-    *_full_principal = NULL;
-
-    if (primary_pattern == NULL || hostname == NULL || realm == NULL) {
-        ret = EINVAL;
-        goto done;
-    }
-
-    primary_part = sss_krb5_get_primary(ctx,
-                                        primary_pattern,
-                                        hostname);
-    if (primary_part == NULL) {
-        ret = ENOMEM;
-        goto done;
-    }
-
-    if (realm_pattern) {
-        realm_part = talloc_asprintf(ctx, realm_pattern, realm);
-        if (realm_part == NULL) {
-            ret = ENOMEM;
-            goto done;
-        }
-    }
-
-    if (realm_part == NULL) {
-        *_full_principal = primary_part;
-        primary_part = NULL;
-    } else {
-        *_full_principal = talloc_asprintf("%s@%s", primary_part, realm_part);
-        if (*_full_principal == NULL) {
-            ret = ENOMEM;
-            goto done;
-        }
-    }
- done:
-    talloc_free(primary_part);
-    talloc_free(realm_part);
-    return ret;
-}
-
-/* find suitable credentials from keytab */
-static errno_t ldap_child_gss_find_host_creds(TALLOC_CTX *ctx,
-                                              const char *hostname,
-                                              const char *realm,
-                                              bool canonicalize,
-                                              int lifetime,
-                                              const char *keytab_name,
-                                              gss_cred_id_t *_creds,
-                                              char **_principal,
-                                              OM_uint32 *_lifetime)
-{
-    char *full_principal;
-    errno_t ret;
-    const char *desired_realm = realm;
-    int idx = 0;
-
-    /**
-     * The %s conversion is passed as-is, the %S conversion is translated to
-     * "short host name"
-     *
-     * Priority of lookup:
-     * - our.hostname@REALM or host/our.hostname@REALM depending on the input
-     * - SHORT.HOSTNAME$@REALM (AD domain)
-     * - host/our.hostname@REALM
-     * - foobar$@REALM (AD domain)
-     * - host/foobar@REALM
-     * - host/foo@BAR
-     * - pick the first principal in the keytab (check host/*)
-     */
-    const char *primary_patterns[] = {"%s", "%S$", "host/%s", "*$", "host/*",
-                                      "host/*", NULL};
-    const char *realm_patterns[] =   {"%s", "%s",  "%s",      "%s", "%s",
-                                      NULL,     NULL};
-
-    /* we do not have full principal, search keytab for known patterns */
-    if (!desired_realm) {
-        desired_realm = "*";
-    }
-    if (!hostname) {
-        hostname = "*";
-    }
-
-    do {
-        ret = sss_compose_principal(ctx,
-                                    primary_patterns[idx],
-                                    realm_patterns[idx],
-                                    hostname,
-                                    realm,
-                                    &full_principal);
-        if (ret != EOK) {
-            talloc_zfree(full_principal);
-            return ret;
-        }
-
-        ret = ldap_child_gss_get_creds(ctx,
-                                       full_principal,
-                                       NULL,
-                                       lifetime,
-                                       canonicalize,
-                                       keytab_name,
-                                       _creds,
-                                       _principal,
-                                       _lifetime);
-        talloc_zfree(full_principal);
-        if (ret == EOK) {
-            break;
-        }
-
-        ++idx;
-    } while(primary_patterns[idx-1] != NULL || realm_patterns[idx-1] != NULL);
-
-    return ret;
-}
 
 static krb5_error_code ldap_child_get_tgt_gss_sync(TALLOC_CTX *memctx,
                                                    krb5_context context,
@@ -721,12 +399,12 @@ static krb5_error_code ldap_child_get_tgt_gss_sync(TALLOC_CTX *memctx,
 
 
     if (princ_str) {
-        error_code = ldap_child_gss_get_creds(memctx,
-                                              princ_str, realm_name,
-                                              canonicalize, lifetime,
-                                              keytab_name,
-                                              &creds, &full_principal,
-                                              &lifetime_out);
+        error_code = sss_gss_get_creds(memctx,
+                                       princ_str, realm_name,
+                                       canonicalize, lifetime,
+                                       keytab_name,
+                                       &creds, &full_principal,
+                                       &lifetime_out);
     } else {
         char hostname[HOST_NAME_MAX + 1];
 
@@ -741,12 +419,12 @@ static krb5_error_code ldap_child_get_tgt_gss_sync(TALLOC_CTX *memctx,
 
         DEBUG(SSSDBG_TRACE_LIBS, "got hostname: [%s]\n", hostname);
 
-        error_code = ldap_child_gss_find_host_creds(memctx,
-                                                    hostname, realm_name,
-                                                    canonicalize, lifetime,
-                                                    keytab_name,
-                                                    &creds, &full_principal,
-                                                    &lifetime_out);
+        error_code = sss_gss_find_host_creds(memctx,
+                                             hostname, realm_name,
+                                             canonicalize, lifetime,
+                                             keytab_name,
+                                             &creds, &full_principal,
+                                             &lifetime_out);
     }
 
     if (error_code != EOK) {
@@ -834,7 +512,7 @@ static krb5_error_code ldap_child_get_tgt_gss_sync(TALLOC_CTX *memctx,
     if (GSS_ERROR(major)) {
         DEBUG(SSSDBG_OP_FAILURE,"gss_krb5_copy_ccache failed\n");
         krberr = KRB5KRB_ERR_GENERIC;
-        *_krb5_msg = gss_error_message(memctx, major);
+        *_krb5_msg = sss_gss_error_message(memctx, major);
         goto done;
     }
 
