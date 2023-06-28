@@ -754,7 +754,7 @@ static errno_t sysdb_cache_connect(TALLOC_CTX *mem_ctx,
     ldb_file_exists = !(access(sysdb->ldb_file, F_OK) == -1 && errno == ENOENT);
 
     ret = sysdb_cache_connect_helper(mem_ctx, domain, sysdb->ldb_file,
-                                      0, SYSDB_VERSION, SYSDB_BASE_LDIF,
+                                      LDB_FLG_NOSYNC, SYSDB_VERSION, SYSDB_BASE_LDIF,
                                       &newly_created, ldb, version);
 
     /* The cache has been newly created. */
