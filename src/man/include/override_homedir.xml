@@ -35,7 +35,8 @@
                 <term>%o</term>
                 <listitem><para>
                     The original home directory retrieved
-                    from the identity provider.
+                    from the identity provider. This option is inteded to be used
+                    with SSSD in server mode i. e. on IPA server. 
                     </para></listitem>
             </varlistentry>
             <varlistentry>
@@ -43,6 +44,7 @@
                 <listitem><para>
                     The original home directory retrieved
                     from the identity provider, but in lower case.
+                    ...
                     </para></listitem>
             </varlistentry>
             <varlistentry>
